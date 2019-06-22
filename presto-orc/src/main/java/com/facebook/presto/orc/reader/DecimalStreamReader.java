@@ -24,6 +24,7 @@ import com.facebook.presto.orc.stream.InputStreamSources;
 import com.facebook.presto.orc.stream.LongInputStream;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
+import com.facebook.presto.spi.block.RunLengthEncodedBlock;
 import com.facebook.presto.spi.type.DecimalType;
 import com.facebook.presto.spi.type.Decimals;
 import com.facebook.presto.spi.type.Type;
@@ -43,7 +44,6 @@ import static com.facebook.presto.orc.stream.MissingInputStreamSource.missingStr
 import static com.facebook.presto.spi.type.UnscaledDecimal128Arithmetic.rescale;
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Verify.verify;
-import static io.airlift.slice.SizeOf.sizeOf;
 import static java.util.Objects.requireNonNull;
 
 public class DecimalStreamReader
@@ -55,9 +55,6 @@ public class DecimalStreamReader
 
     private int readOffset;
     private int nextBatchSize;
-
-    private boolean[] nullVector = new boolean[0];
-    private long[] scaleVector = new long[0];
 
     private InputStreamSource<BooleanInputStream> presentStreamSource = missingStreamSource(BooleanInputStream.class);
     @Nullable
@@ -101,6 +98,16 @@ public class DecimalStreamReader
 
         seekToOffset();
 
+        if (decimalStream == null && scaleStream == null && presentStream != null) {
+            presentStream.skip(nextBatchSize);
+            Block nullValueBlock = new RunLengthEncodedBlock(
+                    type.createBlockBuilder(null, 1).appendNull().build(),
+                    nextBatchSize);
+            readOffset = 0;
+            nextBatchSize = 0;
+            return nullValueBlock;
+        }
+
         BlockBuilder builder = decimalType.createBlockBuilder(null, nextBatchSize);
 
         if (presentStream == null) {
@@ -128,11 +135,11 @@ public class DecimalStreamReader
             }
         }
         else {
+            verify(decimalStream != null);
+            verify(scaleStream != null);
             for (int i = 0; i < nextBatchSize; i++) {
                 if (presentStream.nextBit()) {
                     // The current row is not null
-                    verify(decimalStream != null);
-                    verify(scaleStream != null);
                     long sourceScale = scaleStream.next();
                     if (decimalType.isShort()) {
                         long rescaledDecimal = Decimals.rescale(decimalStream.nextLong(), (int) sourceScale, decimalType.getScale());
@@ -237,13 +244,11 @@ public class DecimalStreamReader
     public void close()
     {
         systemMemoryContext.close();
-        nullVector = null;
-        scaleVector = null;
     }
 
     @Override
     public long getRetainedSizeInBytes()
     {
-        return INSTANCE_SIZE + sizeOf(nullVector) + sizeOf(scaleVector);
+        return INSTANCE_SIZE;
     }
 }

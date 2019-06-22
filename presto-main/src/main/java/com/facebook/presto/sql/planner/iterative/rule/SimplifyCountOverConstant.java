@@ -18,6 +18,9 @@ import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
 import com.facebook.presto.metadata.FunctionManager;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
+import com.facebook.presto.spi.relation.CallExpression;
+import com.facebook.presto.spi.relation.RowExpression;
+import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.sql.planner.plan.AggregationNode;
@@ -36,9 +39,11 @@ import java.util.Map.Entry;
 import java.util.Optional;
 
 import static com.facebook.presto.matching.Capture.newCapture;
+import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.sql.planner.plan.Patterns.aggregation;
 import static com.facebook.presto.sql.planner.plan.Patterns.project;
 import static com.facebook.presto.sql.planner.plan.Patterns.source;
+import static com.facebook.presto.sql.relational.OriginalExpressionUtils.castToExpression;
 import static java.util.Objects.requireNonNull;
 
 public class SimplifyCountOverConstant
@@ -69,17 +74,20 @@ public class SimplifyCountOverConstant
         ProjectNode child = captures.get(CHILD);
 
         boolean changed = false;
-        Map<Symbol, AggregationNode.Aggregation> aggregations = new LinkedHashMap<>(parent.getAggregations());
+        Map<VariableReferenceExpression, AggregationNode.Aggregation> aggregations = new LinkedHashMap<>(parent.getAggregations());
 
-        for (Entry<Symbol, AggregationNode.Aggregation> entry : parent.getAggregations().entrySet()) {
-            Symbol symbol = entry.getKey();
+        for (Entry<VariableReferenceExpression, AggregationNode.Aggregation> entry : parent.getAggregations().entrySet()) {
+            VariableReferenceExpression variable = entry.getKey();
             AggregationNode.Aggregation aggregation = entry.getValue();
 
             if (isCountOverConstant(aggregation, child.getAssignments())) {
                 changed = true;
-                aggregations.put(symbol, new AggregationNode.Aggregation(
-                        functionResolution.countFunction(),
-                        ImmutableList.of(),
+                aggregations.put(variable, new AggregationNode.Aggregation(
+                        new CallExpression(
+                                "count",
+                                functionResolution.countFunction(),
+                                BIGINT,
+                                ImmutableList.of()),
                         Optional.empty(),
                         Optional.empty(),
                         false,
@@ -98,8 +106,8 @@ public class SimplifyCountOverConstant
                 parent.getGroupingSets(),
                 ImmutableList.of(),
                 parent.getStep(),
-                parent.getHashSymbol(),
-                parent.getGroupIdSymbol()));
+                parent.getHashVariable(),
+                parent.getGroupIdVariable()));
     }
 
     private boolean isCountOverConstant(AggregationNode.Aggregation aggregation, Assignments inputs)
@@ -108,11 +116,12 @@ public class SimplifyCountOverConstant
             return false;
         }
 
-        Expression argument = aggregation.getArguments().get(0);
-        if (argument instanceof SymbolReference) {
-            argument = inputs.get(Symbol.from(argument));
+        RowExpression argument = aggregation.getArguments().get(0);
+        Expression assigned = null;
+        if (castToExpression(argument) instanceof SymbolReference) {
+            assigned = castToExpression(inputs.get(Symbol.from(castToExpression(argument))));
         }
 
-        return argument instanceof Literal && !(argument instanceof NullLiteral);
+        return assigned instanceof Literal && !(assigned instanceof NullLiteral);
     }
 }

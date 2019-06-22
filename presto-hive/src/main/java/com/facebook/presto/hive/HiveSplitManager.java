@@ -24,9 +24,12 @@ import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.FixedSplitSource;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.Subfield;
 import com.facebook.presto.spi.TableNotFoundException;
 import com.facebook.presto.spi.connector.ConnectorSplitManager;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
+import com.facebook.presto.spi.predicate.Domain;
+import com.facebook.presto.spi.predicate.TupleDomain;
 import com.google.common.collect.AbstractIterator;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -51,6 +54,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Function;
 
 import static com.facebook.presto.hive.BackgroundHiveSplitLoader.BucketSplitInfo.createBucketSplitInfo;
+import static com.facebook.presto.hive.HiveColumnHandle.isPathColumnHandle;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_INVALID_METADATA;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_PARTITION_DROPPED_DURING_QUERY;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_PARTITION_SCHEMA_MISMATCH;
@@ -152,7 +156,11 @@ public class HiveSplitManager
     }
 
     @Override
-    public ConnectorSplitSource getSplits(ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableLayoutHandle layoutHandle, SplitSchedulingStrategy splitSchedulingStrategy)
+    public ConnectorSplitSource getSplits(
+            ConnectorTransactionHandle transaction,
+            ConnectorSession session,
+            ConnectorTableLayoutHandle layoutHandle,
+            SplitSchedulingContext splitSchedulingContext)
     {
         HiveTableLayoutHandle layout = (HiveTableLayoutHandle) layoutHandle;
         SchemaTableName tableName = layout.getSchemaTableName();
@@ -182,7 +190,7 @@ public class HiveSplitManager
 
         // validate bucket bucketed execution
         Optional<HiveBucketHandle> bucketHandle = layout.getBucketHandle();
-        if ((splitSchedulingStrategy == GROUPED_SCHEDULING) && !bucketHandle.isPresent()) {
+        if ((splitSchedulingContext.getSplitSchedulingStrategy() == GROUPED_SCHEDULING) && !bucketHandle.isPresent()) {
             throw new PrestoException(GENERIC_INTERNAL_ERROR, "SchedulingPolicy is bucketed, but BucketHandle is not present");
         }
 
@@ -197,12 +205,12 @@ public class HiveSplitManager
         // sort partitions
         partitions = Ordering.natural().onResultOf(HivePartition::getPartitionId).reverse().sortedCopy(partitions);
 
-        Iterable<HivePartitionMetadata> hivePartitions = getPartitionMetadata(metastore, table, tableName, partitions, bucketHandle.map(HiveBucketHandle::toTableBucketProperty), session);
+        Iterable<HivePartitionMetadata> hivePartitions = getPartitionMetadata(metastore, table, tableName, partitions, bucketHandle.map(HiveBucketHandle::toTableBucketProperty));
 
         HiveSplitLoader hiveSplitLoader = new BackgroundHiveSplitLoader(
                 table,
                 hivePartitions,
-                layout.getCompactEffectivePredicate(),
+                getPathDomain(layout.getDomainPredicate(), layout.getPredicateColumns()),
                 createBucketSplitInfo(bucketHandle, bucketFilter),
                 session,
                 hdfsEnvironment,
@@ -210,16 +218,19 @@ public class HiveSplitManager
                 directoryLister,
                 executor,
                 splitLoaderConcurrency,
-                recursiveDfsWalkerEnabled);
+                recursiveDfsWalkerEnabled,
+                splitSchedulingContext.schedulerUsesHostAddresses());
 
         HiveSplitSource splitSource;
-        switch (splitSchedulingStrategy) {
+        switch (splitSchedulingContext.getSplitSchedulingStrategy()) {
             case UNGROUPED_SCHEDULING:
                 splitSource = HiveSplitSource.allAtOnce(
                         session,
                         table.getDatabaseName(),
                         table.getTableName(),
-                        layout.getCompactEffectivePredicate(),
+                        layout.getDomainPredicate(),
+                        layout.getRemainingPredicate(),
+                        layout.getPredicateColumns(),
                         maxInitialSplits,
                         maxOutstandingSplits,
                         maxOutstandingSplitsSize,
@@ -232,7 +243,9 @@ public class HiveSplitManager
                         session,
                         table.getDatabaseName(),
                         table.getTableName(),
-                        layout.getCompactEffectivePredicate(),
+                        layout.getDomainPredicate(),
+                        layout.getRemainingPredicate(),
+                        layout.getPredicateColumns(),
                         maxInitialSplits,
                         maxOutstandingSplits,
                         maxOutstandingSplitsSize,
@@ -240,12 +253,36 @@ public class HiveSplitManager
                         executor,
                         new CounterStat());
                 break;
+            case REWINDABLE_GROUPED_SCHEDULING:
+                splitSource = HiveSplitSource.bucketedRewindable(
+                        session,
+                        table.getDatabaseName(),
+                        table.getTableName(),
+                        layout.getDomainPredicate(),
+                        layout.getRemainingPredicate(),
+                        layout.getPredicateColumns(),
+                        maxInitialSplits,
+                        maxOutstandingSplitsSize,
+                        hiveSplitLoader,
+                        executor,
+                        new CounterStat());
+                break;
             default:
-                throw new IllegalArgumentException("Unknown splitSchedulingStrategy: " + splitSchedulingStrategy);
+                throw new IllegalArgumentException("Unknown splitSchedulingStrategy: " + splitSchedulingContext.getSplitSchedulingStrategy());
         }
         hiveSplitLoader.start(splitSource);
 
         return splitSource;
+    }
+
+    private static Optional<Domain> getPathDomain(TupleDomain<Subfield> domainPredicate, Map<String, HiveColumnHandle> predicateColumns)
+    {
+        checkArgument(!domainPredicate.isNone(), "Unexpected domain predicate: none");
+
+        return domainPredicate.getDomains().get().entrySet().stream()
+                .filter(entry -> isPathColumnHandle(predicateColumns.get(entry.getKey().getRootName())))
+                .findFirst()
+                .map(Map.Entry::getValue);
     }
 
     @Managed
@@ -255,7 +292,7 @@ public class HiveSplitManager
         return highMemorySplitSourceCounter;
     }
 
-    private Iterable<HivePartitionMetadata> getPartitionMetadata(SemiTransactionalHiveMetastore metastore, Table table, SchemaTableName tableName, List<HivePartition> hivePartitions, Optional<HiveBucketProperty> bucketProperty, ConnectorSession session)
+    private Iterable<HivePartitionMetadata> getPartitionMetadata(SemiTransactionalHiveMetastore metastore, Table table, SchemaTableName tableName, List<HivePartition> hivePartitions, Optional<HiveBucketProperty> bucketProperty)
     {
         if (hivePartitions.isEmpty()) {
             return ImmutableList.of();

@@ -47,6 +47,7 @@ import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.connector.ConnectorPageSinkProvider;
 import com.facebook.presto.spi.connector.ConnectorPageSourceProvider;
 import com.facebook.presto.spi.connector.ConnectorSplitManager;
+import com.facebook.presto.spi.connector.ConnectorSplitManager.SplitSchedulingContext;
 import com.facebook.presto.spi.security.ConnectorIdentity;
 import com.facebook.presto.sql.analyzer.FeaturesConfig;
 import com.facebook.presto.sql.gen.JoinCompiler;
@@ -82,7 +83,9 @@ import static com.facebook.presto.hive.AbstractTestHiveClient.createTablePropert
 import static com.facebook.presto.hive.AbstractTestHiveClient.filterNonHiddenColumnHandles;
 import static com.facebook.presto.hive.AbstractTestHiveClient.filterNonHiddenColumnMetadata;
 import static com.facebook.presto.hive.AbstractTestHiveClient.getAllSplits;
+import static com.facebook.presto.hive.HiveTestUtils.FUNCTION_RESOLUTION;
 import static com.facebook.presto.hive.HiveTestUtils.PAGE_SORTER;
+import static com.facebook.presto.hive.HiveTestUtils.ROW_EXPRESSION_SERVICE;
 import static com.facebook.presto.hive.HiveTestUtils.TYPE_MANAGER;
 import static com.facebook.presto.hive.HiveTestUtils.getDefaultHiveDataStreamFactories;
 import static com.facebook.presto.hive.HiveTestUtils.getDefaultHiveFileWriterFactories;
@@ -108,6 +111,7 @@ import static org.testng.Assert.assertTrue;
 public abstract class AbstractTestHiveFileSystem
 {
     private static final HdfsContext TESTING_CONTEXT = new HdfsContext(new ConnectorIdentity("test", Optional.empty(), Optional.empty()));
+    public static final SplitSchedulingContext SPLIT_SCHEDULING_CONTEXT = new SplitSchedulingContext(UNGROUPED_SCHEDULING, false);
 
     protected String database;
     protected SchemaTableName table;
@@ -180,6 +184,8 @@ public abstract class AbstractTestHiveFileSystem
                 newDirectExecutorService(),
                 TYPE_MANAGER,
                 locationService,
+                FUNCTION_RESOLUTION,
+                ROW_EXPRESSION_SERVICE,
                 new TableParameterCodec(),
                 partitionUpdateCodec,
                 new HiveTypeTranslator(),
@@ -244,7 +250,7 @@ public abstract class AbstractTestHiveFileSystem
             List<ConnectorTableLayoutResult> tableLayoutResults = metadata.getTableLayouts(session, table, Constraint.alwaysTrue(), Optional.empty());
             HiveTableLayoutHandle layoutHandle = (HiveTableLayoutHandle) getOnlyElement(tableLayoutResults).getTableLayout().getHandle();
             assertEquals(layoutHandle.getPartitions().get().size(), 1);
-            ConnectorSplitSource splitSource = splitManager.getSplits(transaction.getTransactionHandle(), session, layoutHandle, UNGROUPED_SCHEDULING);
+            ConnectorSplitSource splitSource = splitManager.getSplits(transaction.getTransactionHandle(), session, layoutHandle, SPLIT_SCHEDULING_CONTEXT);
 
             long sum = 0;
 
@@ -411,7 +417,7 @@ public abstract class AbstractTestHiveFileSystem
             List<ConnectorTableLayoutResult> tableLayoutResults = metadata.getTableLayouts(session, tableHandle, Constraint.alwaysTrue(), Optional.empty());
             HiveTableLayoutHandle layoutHandle = (HiveTableLayoutHandle) getOnlyElement(tableLayoutResults).getTableLayout().getHandle();
             assertEquals(layoutHandle.getPartitions().get().size(), 1);
-            ConnectorSplitSource splitSource = splitManager.getSplits(transaction.getTransactionHandle(), session, layoutHandle, UNGROUPED_SCHEDULING);
+            ConnectorSplitSource splitSource = splitManager.getSplits(transaction.getTransactionHandle(), session, layoutHandle, SPLIT_SCHEDULING_CONTEXT);
             ConnectorSplit split = getOnlyElement(getAllSplits(splitSource));
 
             try (ConnectorPageSource pageSource = pageSourceProvider.createPageSource(transaction.getTransactionHandle(), session, split, columnHandles)) {

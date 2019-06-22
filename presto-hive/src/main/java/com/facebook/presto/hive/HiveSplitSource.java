@@ -16,13 +16,14 @@ package com.facebook.presto.hive;
 import com.facebook.presto.hive.InternalHiveSplit.InternalHiveBlock;
 import com.facebook.presto.hive.util.AsyncQueue;
 import com.facebook.presto.hive.util.AsyncQueue.BorrowResult;
-import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorSplit;
 import com.facebook.presto.spi.ConnectorSplitSource;
 import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.Subfield;
 import com.facebook.presto.spi.connector.ConnectorPartitionHandle;
 import com.facebook.presto.spi.predicate.TupleDomain;
+import com.facebook.presto.spi.relation.RowExpression;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.Futures;
@@ -55,7 +56,6 @@ import static com.facebook.presto.hive.HiveErrorCode.HIVE_FILE_NOT_FOUND;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_UNKNOWN_ERROR;
 import static com.facebook.presto.hive.HiveSessionProperties.getMaxInitialSplitSize;
 import static com.facebook.presto.hive.HiveSessionProperties.getMaxSplitSize;
-import static com.facebook.presto.hive.HiveSessionProperties.isUseRewindableSplitSource;
 import static com.facebook.presto.hive.HiveSplitSource.StateKind.CLOSED;
 import static com.facebook.presto.hive.HiveSplitSource.StateKind.FAILED;
 import static com.facebook.presto.hive.HiveSplitSource.StateKind.INITIAL;
@@ -83,7 +83,9 @@ class HiveSplitSource
     private final String queryId;
     private final String databaseName;
     private final String tableName;
-    private final TupleDomain<? extends ColumnHandle> compactEffectivePredicate;
+    private final TupleDomain<Subfield> domainPredicate;
+    private final RowExpression remainingPredicate;
+    private final Map<String, HiveColumnHandle> predicateColumns;
     private final PerBucket queues;
     private final AtomicInteger bufferedInternalSplitCount = new AtomicInteger();
     private final int maxOutstandingSplitsBytes;
@@ -105,18 +107,23 @@ class HiveSplitSource
             ConnectorSession session,
             String databaseName,
             String tableName,
-            TupleDomain<? extends ColumnHandle> compactEffectivePredicate,
+            TupleDomain<Subfield> domainPredicate,
+            RowExpression remainingPredicate,
+            Map<String, HiveColumnHandle> predicateColumns,
             PerBucket queues,
             int maxInitialSplits,
             DataSize maxOutstandingSplitsSize,
             HiveSplitLoader splitLoader,
-            CounterStat highMemorySplitSourceCounter)
+            CounterStat highMemorySplitSourceCounter,
+            boolean useRewindableSplitSource)
     {
         requireNonNull(session, "session is null");
         this.queryId = session.getQueryId();
         this.databaseName = requireNonNull(databaseName, "databaseName is null");
         this.tableName = requireNonNull(tableName, "tableName is null");
-        this.compactEffectivePredicate = requireNonNull(compactEffectivePredicate, "compactEffectivePredicate is null");
+        this.domainPredicate = requireNonNull(domainPredicate, "domainPredicate is null");
+        this.remainingPredicate = requireNonNull(remainingPredicate, "remainingPredicate is null");
+        this.predicateColumns = requireNonNull(predicateColumns, "predicateColumns is null");
         this.queues = requireNonNull(queues, "queues is null");
         this.maxOutstandingSplitsBytes = toIntExact(maxOutstandingSplitsSize.toBytes());
         this.splitLoader = requireNonNull(splitLoader, "splitLoader is null");
@@ -124,7 +131,7 @@ class HiveSplitSource
 
         this.maxSplitSize = getMaxSplitSize(session);
         this.maxInitialSplitSize = getMaxInitialSplitSize(session);
-        this.useRewindableSplitSource = isUseRewindableSplitSource(session);
+        this.useRewindableSplitSource = useRewindableSplitSource;
         this.remainingInitialSplits = new AtomicInteger(maxInitialSplits);
     }
 
@@ -132,7 +139,9 @@ class HiveSplitSource
             ConnectorSession session,
             String databaseName,
             String tableName,
-            TupleDomain<? extends ColumnHandle> compactEffectivePredicate,
+            TupleDomain<Subfield> domainPredicate,
+            RowExpression remainingPredicate,
+            Map<String, HiveColumnHandle> predicateColumns,
             int maxInitialSplits,
             int maxOutstandingSplits,
             DataSize maxOutstandingSplitsSize,
@@ -144,7 +153,9 @@ class HiveSplitSource
                 session,
                 databaseName,
                 tableName,
-                compactEffectivePredicate,
+                domainPredicate,
+                remainingPredicate,
+                predicateColumns,
                 new PerBucket()
                 {
                     private final AsyncQueue<InternalHiveSplit> queue = new AsyncQueue<>(maxOutstandingSplits, executor);
@@ -185,14 +196,17 @@ class HiveSplitSource
                 maxInitialSplits,
                 maxOutstandingSplitsSize,
                 splitLoader,
-                highMemorySplitSourceCounter);
+                highMemorySplitSourceCounter,
+                false);
     }
 
     public static HiveSplitSource bucketed(
             ConnectorSession session,
             String databaseName,
             String tableName,
-            TupleDomain<? extends ColumnHandle> compactEffectivePredicate,
+            TupleDomain<Subfield> domainPredicate,
+            RowExpression remainingPredicate,
+            Map<String, HiveColumnHandle> predicateColumns,
             int estimatedOutstandingSplitsPerBucket,
             int maxInitialSplits,
             DataSize maxOutstandingSplitsSize,
@@ -204,7 +218,9 @@ class HiveSplitSource
                 session,
                 databaseName,
                 tableName,
-                compactEffectivePredicate,
+                domainPredicate,
+                remainingPredicate,
+                predicateColumns,
                 new PerBucket()
                 {
                     private final Map<Integer, AsyncQueue<InternalHiveSplit>> queues = new ConcurrentHashMap<>();
@@ -265,14 +281,17 @@ class HiveSplitSource
                 maxInitialSplits,
                 maxOutstandingSplitsSize,
                 splitLoader,
-                highMemorySplitSourceCounter);
+                highMemorySplitSourceCounter,
+                false);
     }
 
     public static HiveSplitSource bucketedRewindable(
             ConnectorSession session,
             String databaseName,
             String tableName,
-            TupleDomain<? extends ColumnHandle> compactEffectivePredicate,
+            TupleDomain<Subfield> domainPredicate,
+            RowExpression remainingPredicate,
+            Map<String, HiveColumnHandle> predicateColumns,
             int maxInitialSplits,
             DataSize maxOutstandingSplitsSize,
             HiveSplitLoader splitLoader,
@@ -283,7 +302,9 @@ class HiveSplitSource
                 session,
                 databaseName,
                 tableName,
-                compactEffectivePredicate,
+                domainPredicate,
+                remainingPredicate,
+                predicateColumns,
                 new PerBucket()
                 {
                     @GuardedBy("this")
@@ -344,11 +365,19 @@ class HiveSplitSource
                         }
                         return revivedSplitCount;
                     }
+
+                    @Override
+                    public int decrementAndGetPartitionReferences(InternalHiveSplit split)
+                    {
+                        // we keep all splits forever so references should never decrease
+                        throw new UnsupportedOperationException("decrementPartitionReferences is not supported for rewindable split sources");
+                    }
                 },
                 maxInitialSplits,
                 maxOutstandingSplitsSize,
                 splitLoader,
-                highMemorySplitSourceCounter);
+                highMemorySplitSourceCounter,
+                true);
     }
 
     /**
@@ -375,6 +404,14 @@ class HiveSplitSource
         if (stateReference.get().getKind() != INITIAL) {
             return immediateFuture(null);
         }
+
+        // The PartitionInfo isn't included in the size of the InternalHiveSplit
+        // because it's a shared object. If this is the first InternalHiveSplit
+        // for that PartitionInfo, add its cost
+        if (split.getPartitionInfo().incrementAndGetReferences() == 1) {
+            estimatedSplitSizeInBytes.addAndGet(split.getPartitionInfo().getEstimatedSizeInBytes());
+        }
+
         if (estimatedSplitSizeInBytes.addAndGet(split.getEstimatedSizeInBytes()) > maxOutstandingSplitsBytes) {
             // TODO: investigate alternative split discovery strategies when this error is hit.
             // This limit should never be hit given there is a limit of maxOutstandingSplits.
@@ -473,7 +510,9 @@ class HiveSplitSource
                         internalSplit.getReadBucketNumber(),
                         internalSplit.getTableBucketNumber(),
                         internalSplit.isForceLocalScheduling(),
-                        (TupleDomain<HiveColumnHandle>) compactEffectivePredicate,
+                        domainPredicate,
+                        remainingPredicate,
+                        predicateColumns,
                         transformValues(internalSplit.getColumnCoercions(), HiveTypeName::toHiveType),
                         internalSplit.getBucketConversion(),
                         internalSplit.isS3SelectPushdownEnabled()));
@@ -482,6 +521,11 @@ class HiveSplitSource
 
                 if (internalSplit.isDone()) {
                     removedEstimatedSizeInBytes += internalSplit.getEstimatedSizeInBytes();
+
+                    // rewindable split sources keep their splits forever
+                    if (!useRewindableSplitSource && queues.decrementAndGetPartitionReferences(internalSplit) == 0) {
+                        removedEstimatedSizeInBytes += internalSplit.getPartitionInfo().getEstimatedSizeInBytes();
+                    }
                 }
                 else {
                     splitsToInsertBuilder.add(internalSplit);
@@ -604,6 +648,11 @@ class HiveSplitSource
 
         // returns the number of finished InternalHiveSplits that are rewound
         int rewind(OptionalInt bucketNumber);
+
+        default int decrementAndGetPartitionReferences(InternalHiveSplit split)
+        {
+            return split.getPartitionInfo().decrementAndGetReferences();
+        }
     }
 
     static class State

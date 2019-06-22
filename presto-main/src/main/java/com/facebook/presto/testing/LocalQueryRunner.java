@@ -18,7 +18,6 @@ import com.facebook.presto.PagesIndexPageSorter;
 import com.facebook.presto.Session;
 import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.block.BlockEncodingManager;
-import com.facebook.presto.connector.ConnectorId;
 import com.facebook.presto.connector.ConnectorManager;
 import com.facebook.presto.connector.system.AnalyzePropertiesSystemTable;
 import com.facebook.presto.connector.system.CatalogSystemTable;
@@ -99,12 +98,16 @@ import com.facebook.presto.server.PluginManager;
 import com.facebook.presto.server.PluginManagerConfig;
 import com.facebook.presto.server.SessionPropertyDefaults;
 import com.facebook.presto.server.security.PasswordAuthenticatorManager;
+import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.PageIndexerFactory;
 import com.facebook.presto.spi.PageSorter;
 import com.facebook.presto.spi.Plugin;
 import com.facebook.presto.spi.connector.ConnectorFactory;
+import com.facebook.presto.spi.connector.ConnectorSplitManager.SplitSchedulingStrategy;
+import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
+import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spiller.FileSingleStreamSpillerFactory;
 import com.facebook.presto.spiller.GenericPartitioningSpillerFactory;
 import com.facebook.presto.spiller.GenericSpillerFactory;
@@ -127,6 +130,7 @@ import com.facebook.presto.sql.gen.OrderingCompiler;
 import com.facebook.presto.sql.gen.PageFunctionCompiler;
 import com.facebook.presto.sql.gen.RowExpressionPredicateCompiler;
 import com.facebook.presto.sql.parser.SqlParser;
+import com.facebook.presto.sql.planner.ConnectorPlanOptimizerManager;
 import com.facebook.presto.sql.planner.LocalExecutionPlanner;
 import com.facebook.presto.sql.planner.LocalExecutionPlanner.LocalExecutionPlan;
 import com.facebook.presto.sql.planner.LogicalPlanner;
@@ -134,10 +138,11 @@ import com.facebook.presto.sql.planner.NodePartitioningManager;
 import com.facebook.presto.sql.planner.Plan;
 import com.facebook.presto.sql.planner.PlanFragmenter;
 import com.facebook.presto.sql.planner.PlanOptimizers;
+import com.facebook.presto.sql.planner.RuleStatsRecorder;
 import com.facebook.presto.sql.planner.SubPlan;
+import com.facebook.presto.sql.planner.iterative.IterativeOptimizer;
 import com.facebook.presto.sql.planner.optimizations.PlanOptimizer;
-import com.facebook.presto.sql.planner.plan.PlanNode;
-import com.facebook.presto.sql.planner.plan.TableScanNode;
+import com.facebook.presto.sql.planner.optimizations.TranslateExpressions;
 import com.facebook.presto.sql.planner.planPrinter.PlanPrinter;
 import com.facebook.presto.sql.planner.sanity.PlanSanityChecker;
 import com.facebook.presto.sql.relational.RowExpressionDeterminismEvaluator;
@@ -181,6 +186,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -192,6 +198,7 @@ import java.util.function.Function;
 
 import static com.facebook.presto.cost.StatsCalculatorModule.createNewStatsCalculator;
 import static com.facebook.presto.spi.connector.ConnectorSplitManager.SplitSchedulingStrategy.GROUPED_SCHEDULING;
+import static com.facebook.presto.spi.connector.ConnectorSplitManager.SplitSchedulingStrategy.REWINDABLE_GROUPED_SCHEDULING;
 import static com.facebook.presto.spi.connector.ConnectorSplitManager.SplitSchedulingStrategy.UNGROUPED_SCHEDULING;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
 import static com.facebook.presto.sql.ParsingUtil.createParsingOptions;
@@ -235,6 +242,7 @@ public class LocalQueryRunner
     private final PageSourceManager pageSourceManager;
     private final IndexManager indexManager;
     private final NodePartitioningManager nodePartitioningManager;
+    private final ConnectorPlanOptimizerManager planOptimizerManager;
     private final PageSinkManager pageSinkManager;
     private final TransactionManager transactionManager;
     private final FileSingleStreamSpillerFactory singleStreamSpillerFactory;
@@ -302,6 +310,7 @@ public class LocalQueryRunner
                 catalogManager,
                 notificationExecutor);
         this.nodePartitioningManager = new NodePartitioningManager(nodeScheduler);
+        this.planOptimizerManager = new ConnectorPlanOptimizerManager();
 
         this.blockEncodingManager = new BlockEncodingManager(typeRegistry);
         this.metadata = new MetadataManager(
@@ -314,7 +323,7 @@ public class LocalQueryRunner
                 new ColumnPropertyManager(),
                 new AnalyzePropertyManager(),
                 transactionManager);
-        this.splitManager = new SplitManager(metadata, new QueryManagerConfig());
+        this.splitManager = new SplitManager(metadata, new QueryManagerConfig(), nodeSchedulerConfig);
         this.planFragmenter = new PlanFragmenter(this.metadata, this.nodePartitioningManager, new QueryManagerConfig(), sqlParser);
         this.joinCompiler = new JoinCompiler(metadata, featuresConfig);
         this.pageIndexerFactory = new GroupByHashPageIndexerFactory(joinCompiler);
@@ -338,6 +347,7 @@ public class LocalQueryRunner
                 pageSourceManager,
                 indexManager,
                 nodePartitioningManager,
+                planOptimizerManager,
                 pageSinkManager,
                 new HandleResolver(),
                 nodeManager,
@@ -481,6 +491,12 @@ public class LocalQueryRunner
     public NodePartitioningManager getNodePartitioningManager()
     {
         return nodePartitioningManager;
+    }
+
+    @Override
+    public ConnectorPlanOptimizerManager getPlanOptimizerManager()
+    {
+        return planOptimizerManager;
     }
 
     public PageSourceManager getPageSourceManager()
@@ -742,7 +758,7 @@ public class LocalQueryRunner
                 subplan.getFragment().getRoot(),
                 subplan.getFragment().getPartitioningScheme().getOutputLayout(),
                 plan.getTypes(),
-                subplan.getFragment().getPartitionedSources(),
+                subplan.getFragment().getTableScanSchedulingOrder(),
                 outputFactory,
                 new TaskExchangeClientManager(ignored -> {
                     throw new UnsupportedOperationException();
@@ -755,7 +771,7 @@ public class LocalQueryRunner
             SplitSource splitSource = splitManager.getSplits(
                     session,
                     tableScan.getTable(),
-                    stageExecutionDescriptor.isScanGroupedExecution(tableScan.getId()) ? GROUPED_SCHEDULING : UNGROUPED_SCHEDULING);
+                    getSplitSchedulingStrategy(stageExecutionDescriptor, tableScan.getId()));
 
             ImmutableSet.Builder<ScheduledSplit> scheduledSplits = ImmutableSet.builder();
             while (!splitSource.isFinished()) {
@@ -784,11 +800,11 @@ public class LocalQueryRunner
         }
 
         // add sources to the drivers
-        ImmutableSet<PlanNodeId> partitionedSources = ImmutableSet.copyOf(subplan.getFragment().getPartitionedSources());
+        Set<PlanNodeId> tableScanPlanNodeIds = ImmutableSet.copyOf(subplan.getFragment().getTableScanSchedulingOrder());
         for (TaskSource source : sources) {
             DriverFactory driverFactory = driverFactoriesBySource.get(source.getPlanNodeId());
             checkState(driverFactory != null);
-            boolean partitioned = partitionedSources.contains(driverFactory.getSourceId().get());
+            boolean partitioned = tableScanPlanNodeIds.contains(driverFactory.getSourceId().get());
             for (ScheduledSplit split : source.getSplits()) {
                 DriverContext driverContext = taskContext.addPipelineContext(driverFactory.getPipelineId(), driverFactory.isInputDriver(), driverFactory.isOutputDriver(), partitioned).addDriverContext();
                 Driver driver = driverFactory.createDriver(driverContext);
@@ -802,6 +818,17 @@ public class LocalQueryRunner
         }
 
         return ImmutableList.copyOf(drivers);
+    }
+
+    private static SplitSchedulingStrategy getSplitSchedulingStrategy(StageExecutionDescriptor stageExecutionDescriptor, PlanNodeId scanNodeId)
+    {
+        if (stageExecutionDescriptor.isRecoverableGroupedExecution()) {
+            return REWINDABLE_GROUPED_SCHEDULING;
+        }
+        if (stageExecutionDescriptor.isScanGroupedExecution(scanNodeId)) {
+            return GROUPED_SCHEDULING;
+        }
+        return UNGROUPED_SCHEDULING;
     }
 
     @Override
@@ -836,6 +863,7 @@ public class LocalQueryRunner
                 forceSingleNode,
                 new MBeanExporter(new TestingMBeanServer()),
                 splitManager,
+                planOptimizerManager,
                 pageSourceManager,
                 statsCalculator,
                 costCalculator,
@@ -885,5 +913,17 @@ public class LocalQueryRunner
         return searchFrom(node)
                 .where(TableScanNode.class::isInstance)
                 .findAll();
+    }
+
+    public PlanOptimizer translateExpressions()
+    {
+        // Translate all OriginalExpression in planNodes to RowExpression so that we can do plan pattern asserting and printing on RowExpression only.
+        return new IterativeOptimizer(
+                new RuleStatsRecorder(),
+                getStatsCalculator(),
+                getCostCalculator(),
+                new ImmutableSet.Builder()
+                        .addAll(new TranslateExpressions(getMetadata(), getSqlParser()).rules())
+                        .build());
     }
 }

@@ -14,7 +14,6 @@
 package com.facebook.presto.execution;
 
 import com.facebook.presto.block.BlockEncodingManager;
-import com.facebook.presto.connector.ConnectorId;
 import com.facebook.presto.execution.buffer.BufferResult;
 import com.facebook.presto.execution.buffer.BufferState;
 import com.facebook.presto.execution.buffer.OutputBuffer;
@@ -39,6 +38,7 @@ import com.facebook.presto.operator.StageExecutionDescriptor;
 import com.facebook.presto.operator.TaskContext;
 import com.facebook.presto.operator.TaskOutputOperator.TaskOutputOperatorFactory;
 import com.facebook.presto.operator.ValuesOperator.ValuesOperatorFactory;
+import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.ConnectorSplit;
 import com.facebook.presto.spi.HostAddress;
 import com.facebook.presto.spi.Page;
@@ -168,7 +168,9 @@ public class TestSqlTaskExecution
                             OptionalInt.empty(),
                             executionStrategy)),
                     ImmutableList.of(TABLE_SCAN_NODE_ID),
-                    executionStrategy == GROUPED_EXECUTION ? StageExecutionDescriptor.fixedLifespanScheduleGroupedExecution(ImmutableList.of(TABLE_SCAN_NODE_ID)) : StageExecutionDescriptor.ungroupedExecution());
+                    executionStrategy == GROUPED_EXECUTION
+                            ? StageExecutionDescriptor.fixedLifespanScheduleGroupedExecution(ImmutableList.of(TABLE_SCAN_NODE_ID), 8)
+                            : StageExecutionDescriptor.ungroupedExecution());
             TaskContext taskContext = newTestingTaskContext(taskNotificationExecutor, driverYieldExecutor, taskStateMachine);
             SqlTaskExecution sqlTaskExecution = SqlTaskExecution.createSqlTaskExecution(
                     taskStateMachine,
@@ -424,7 +426,9 @@ public class TestSqlTaskExecution
                                     OptionalInt.empty(),
                                     UNGROUPED_EXECUTION)),
                     ImmutableList.of(scan2NodeId, scan0NodeId),
-                    executionStrategy == GROUPED_EXECUTION ? StageExecutionDescriptor.fixedLifespanScheduleGroupedExecution(ImmutableList.of(scan0NodeId, scan2NodeId)) : StageExecutionDescriptor.ungroupedExecution());
+                    executionStrategy == GROUPED_EXECUTION
+                            ? StageExecutionDescriptor.fixedLifespanScheduleGroupedExecution(ImmutableList.of(scan0NodeId, scan2NodeId), 4)
+                            : StageExecutionDescriptor.ungroupedExecution());
             TaskContext taskContext = newTestingTaskContext(taskNotificationExecutor, driverYieldExecutor, taskStateMachine);
             SqlTaskExecution sqlTaskExecution = SqlTaskExecution.createSqlTaskExecution(
                     taskStateMachine,

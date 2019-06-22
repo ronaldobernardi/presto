@@ -23,6 +23,7 @@ import com.facebook.presto.orc.stream.InputStreamSources;
 import com.facebook.presto.orc.stream.LongInputStream;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
+import com.facebook.presto.spi.block.RunLengthEncodedBlock;
 import com.facebook.presto.spi.type.Type;
 import org.openjdk.jol.info.ClassLayout;
 
@@ -35,8 +36,6 @@ import static com.facebook.presto.orc.metadata.Stream.StreamKind.DATA;
 import static com.facebook.presto.orc.metadata.Stream.StreamKind.PRESENT;
 import static com.facebook.presto.orc.stream.MissingInputStreamSource.missingStreamSource;
 import static com.google.common.base.MoreObjects.toStringHelper;
-import static com.google.common.base.Verify.verify;
-import static io.airlift.slice.SizeOf.sizeOf;
 import static java.util.Objects.requireNonNull;
 
 public class LongDirectStreamReader
@@ -52,7 +51,6 @@ public class LongDirectStreamReader
     private InputStreamSource<BooleanInputStream> presentStreamSource = missingStreamSource(BooleanInputStream.class);
     @Nullable
     private BooleanInputStream presentStream;
-    private boolean[] nullVector = new boolean[0];
 
     private InputStreamSource<LongInputStream> dataStreamSource = missingStreamSource(LongInputStream.class);
     @Nullable
@@ -97,6 +95,16 @@ public class LongDirectStreamReader
             }
         }
 
+        if (dataStream == null && presentStream != null) {
+            presentStream.skip(nextBatchSize);
+            Block nullValueBlock = new RunLengthEncodedBlock(
+                    type.createBlockBuilder(null, 1).appendNull().build(),
+                    nextBatchSize);
+            readOffset = 0;
+            nextBatchSize = 0;
+            return nullValueBlock;
+        }
+
         BlockBuilder builder = type.createBlockBuilder(null, nextBatchSize);
         if (presentStream == null) {
             if (dataStream == null) {
@@ -107,7 +115,6 @@ public class LongDirectStreamReader
         else {
             for (int i = 0; i < nextBatchSize; i++) {
                 if (presentStream.nextBit()) {
-                    verify(dataStream != null);
                     type.writeLong(builder, dataStream.next());
                 }
                 else {
@@ -173,12 +180,11 @@ public class LongDirectStreamReader
     public void close()
     {
         systemMemoryContext.close();
-        nullVector = null;
     }
 
     @Override
     public long getRetainedSizeInBytes()
     {
-        return INSTANCE_SIZE + sizeOf(nullVector);
+        return INSTANCE_SIZE;
     }
 }
